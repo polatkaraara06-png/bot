@@ -1,0 +1,14 @@
+PWD: /Users/kenush/Projects/trading_bot
+ws_status: {'spot': 'disconnected', 'futures': 'disconnected'}
+open_trades: 0
+closed_trades: 0
+closed_trades sample: []
+accounts snippet: {"spot": {"balance": 10000.0}, "futures": {"balance": 10000.0, "margin_mode": "cross"}}
+[OK] core.scanner
+[OK] core.scanner.start_scanner_thread
+[OK] core.scanner.start_auto_trade
+[OK] core.paper_trader
+[OK] core.paper_trader.execute_trade
+[OK] core.decision_engine.simple_decision
+[OK] core.ai.learning_module
+[OK] core.ai.learning_module.start_learning_thread

@@ -1,0 +1,103 @@
+import os, json, time, socket, threading
+from websocket import WebSocketApp
+from dotenv import load_dotenv
+from ..shared_state import shared_state
+
+# --- IPv4 ONLY ---
+_orig_getaddrinfo = socket.getaddrinfo
+def _only_ipv4(*a, **k):
+    return [r for r in _orig_getaddrinfo(*a, **k) if r[0]==socket.AF_INET]
+socket.getaddrinfo = _only_ipv4
+
+load_dotenv()
+
+WSS_URL = os.getenv("WSS_URL_SPOT", "wss://stream.bybit.com/v5/public/spot")
+
+# 50er Universum (kannst du per .env/Code anpassen)
+BASE_UNIVERSE = [
+    "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOGEUSDT",
+    "TRXUSDT","MATICUSDT","DOTUSDT","LTCUSDT","BCHUSDT","ATOMUSDT","LINKUSDT",
+    "XLMUSDT","XMRUSDT","APTUSDT","ARBUSDT","OPUSDT","NEARUSDT","ICPUSDT",
+    "FTMUSDT","INJUSDT","SUIUSDT","HBARUSDT","ALGOUSDT","GALAUSDT","SANDUSDT",
+    "AXSUSDT","APEUSDT","RNDRUSDT","PEPEUSDT","SHIBUSDT","TONUSDT","FLOWUSDT",
+    "EGLDUSDT","CRVUSDT","AAVEUSDT","DYDXUSDT","FILUSDT","BLURUSDT","STXUSDT",
+    "ONEUSDT","RUNEUSDT","ETCUSDT","KASUSDT","SEIUSDT","TIAUSDT"
+]
+
+def _on_message(ws, msg):
+    try:
+        data = json.loads(msg)
+    except Exception as e:
+        print("[WSS-SPOT] ⚠ JSON-Decode:", e, msg[:120])
+        return
+
+    topic = data.get("topic","")
+    # Logge die ersten paar Messages grob mit Topic
+    if hasattr(_on_message, "_cnt"):
+        _on_message._cnt += 1
+    else:
+        _on_message._cnt = 1
+    if _on_message._cnt <= 5:
+        print(f"[WSS-SPOT] 📨 MSG#{_on_message._cnt} topic={topic}")
+
+    if topic.startswith("tickers."):
+        arr = data.get("data")
+        if isinstance(arr, dict):
+            arr = [arr]
+        now = time.time()
+        ins = 0
+        for it in arr or []:
+            sym = (it.get("symbol") or "").upper()
+            last = it.get("lastPrice") or it.get("price")
+            if sym and last:
+                try:
+                    shared_state.upsert_tick("spot", sym, float(last), now)
+                    ins += 1
+                except Exception as e:
+                    print("[WSS-SPOT] ⚠ upsert_tick error:", e)
+        if ins:
+            shared_state.ws_status["spot"] = "connected"
+            # Debug: Anzahl Keys anzeigen
+            try:
+                snap = shared_state.snapshot()
+                print(f"[WSS-SPOT] ✅ gespeichert: +{ins} | ticks_total={len(snap.get('ticks',{}))}")
+            except Exception as e:
+                print("[WSS-SPOT] ⚠ snapshot error:", e)
+        return
+
+    # (Optional) Ping/Pong
+    if "op" in data and data.get("op") == "ping":
+        try:
+            ws.send(json.dumps({"op":"pong"}))
+        except Exception:
+            pass
+
+def _on_open(ws):
+    # *** WICHTIG: KORREKTES TOPIC: 'tickers.<SYM>' (KEIN 'public/tickers') ***
+    subs = [f"tickers.{s}" for s in BASE_UNIVERSE]
+    payload = {"op":"subscribe","args":subs}
+    ws.send(json.dumps(payload))
+    shared_state.ws_status["spot"] = "subscribed"
+    print(f"[WSS-SPOT] Subscribed to {len(subs)} symbols (tickers.*).")
+
+def _on_error(ws, e):
+    shared_state.ws_status["spot"] = f"error:{e}"
+    print("[WSS-SPOT] ❌ on_error:", e)
+
+def _on_close(ws, *a):
+    shared_state.ws_status["spot"] = "disconnected"
+    print("[WSS-SPOT] 🔌 geschlossen")
+
+def run():
+    # eigener Thread + Reconnect-Loop (nur WSS)
+    def loop():
+        while True:
+            try:
+                print(f"[WSS-SPOT] Connecting to {WSS_URL}")
+                ws = WebSocketApp(WSS_URL, on_open=_on_open, on_message=_on_message,
+                                  on_error=_on_error, on_close=_on_close)
+                ws.run_forever(ping_interval=15, ping_timeout=10)
+            except Exception as e:
+                print("[WSS-SPOT] crash:", e)
+            time.sleep(3)
+    threading.Thread(target=loop, daemon=True, name="SpotWS").start()

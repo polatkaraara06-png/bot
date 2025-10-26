@@ -1,0 +1,47 @@
+
+import json, os, threading, time
+from core.ai import learning_module
+
+EXPERIENCE_PATH = "data/experience.jsonl"
+
+# Jetzt nutzt alles die RLAgent-Klasse statt dict
+agent = learning_module.load_model()
+experience_buffer = []
+
+def add_experience(symbol, action, reward, features):
+    global agent
+    exp = {
+        "ts": time.time(),
+        "symbol": symbol,
+        "action": action,
+        "reward": float(reward),
+        "features": features
+    }
+    experience_buffer.append(exp)
+    if len(experience_buffer) > 100:
+        experience_buffer.pop(0)
+    # Update Agent-Wissen
+    agent.update(float(reward))
+    agent.save()
+    # Log einzeln in Datei
+    os.makedirs("data", exist_ok=True)
+    with open(EXPERIENCE_PATH, "a") as f:
+        json.dump(exp, f)
+        f.write("\n")
+    print(f"[ONLINE_RL] +Experience ({symbol}, {action}, {reward:+.2f}) | Level={agent.level}")
+
+def learning_loop():
+    print("[ONLINE_RL] Lernloop aktiv (Background)...")
+    while True:
+        time.sleep(60)
+        try:
+            agent.save()
+            print(f"[ONLINE_RL] 🔄 Modell gespeichert (Level={agent.level}, Perf={agent.performance:+.2f})")
+        except Exception as e:
+            print("[ONLINE_RL] ⚠️ Save-Error:", e)
+
+def start_online_rl_thread():
+    t = threading.Thread(target=learning_loop, daemon=True)
+    t.start()
+    print("[ONLINE_RL] Live-Training gestartet ✅")
+    return t

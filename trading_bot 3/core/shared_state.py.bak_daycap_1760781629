@@ -1,0 +1,95 @@
+from __future__ import annotations
+import threading, time, os, json
+from collections import defaultdict, deque
+import pandas as pd
+
+class SharedState:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.ts_started = time.time()
+
+        # Live-Daten
+        self.ticks = defaultdict(dict)                      # {(market,symbol)} -> {"price","ts",...}
+        self.bars = defaultdict(lambda: defaultdict(deque))  # bars[tf][(m,s)] -> deque
+        self.features = {}                                   # {(market,symbol)} -> dict
+        self.anomaly = {}                                    # {(market,symbol)} -> dict
+
+        # Trading
+        self.open_trades = []
+        self.closed_trades = []
+        self.accounts = {
+            "spot": {"balance": 10000.0},
+            "futures": {"balance": 10000.0, "margin_mode": "cross"},
+            "daycap": {"total": 175.0, "used": 0.0},
+            "total_pnl": 0.0
+        }
+
+        self.latency_ms = 0
+        self.ws_status = {"spot": "disconnected", "futures": "disconnected"}
+        self.last_autosave = 0.0
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "ticks": dict(self.ticks),
+                "features": dict(self.features),
+                "anomaly": dict(self.anomaly),
+                "open_trades": list(self.open_trades),
+                "closed_trades": list(self.closed_trades),
+                "accounts": json.loads(json.dumps(self.accounts)),  # deep-copy & json-safe
+                "latency_ms": self.latency_ms,
+                "ws_status": dict(self.ws_status)
+            }
+
+    def autosave(self, root: str = "data"):
+        os.makedirs(root, exist_ok=True)
+        with self.lock:
+            try:
+                pd.DataFrame(self.open_trades).to_csv(os.path.join(root, "open_trades.csv"), index=False)
+            except Exception:
+                pass
+            try:
+                pd.DataFrame(self.closed_trades).to_csv(os.path.join(root, "closed_trades.csv"), index=False)
+            except Exception:
+                pass
+            try:
+                with open(os.path.join(root, "accounts.json"), "w", encoding="utf-8") as f:
+                    json.dump(self.accounts, f, ensure_ascii=False)
+            except Exception:
+                pass
+            self.last_autosave = time.time()
+
+    def autoload(self, root: str = "data"):
+        os.makedirs(root, exist_ok=True)
+        with self.lock:
+            # Open trades
+            try:
+                df = pd.read_csv(os.path.join(root, "open_trades.csv"))
+                self.open_trades = df.to_dict("records")
+            except Exception:
+                pass
+
+            # Closed trades
+            try:
+                df = pd.read_csv(os.path.join(root, "closed_trades.csv"))
+                self.closed_trades = df.to_dict("records")
+            except Exception:
+                pass
+
+            # Accounts
+            try:
+                with open(os.path.join(root, "accounts.json"), "r", encoding="utf-8") as f:
+                    acc = json.load(f)
+                if isinstance(acc, dict):
+                    self.accounts.update(acc)
+            except Exception:
+                pass
+
+            # Testphase: Daycap.used immer auf 0 setzen
+            try:
+                self.accounts.setdefault("daycap", {"total": 175.0, "used": 0.0})
+                self.accounts["daycap"]["used"] = 0.0
+            except Exception:
+                pass
+
+shared_state = SharedState()

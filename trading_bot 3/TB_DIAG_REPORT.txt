@@ -1,0 +1,43 @@
+
+======== SYSTEM ========
+
+Python: 3.11.14
+Platform: macOS-14.1.1-arm64-arm-64bit
+
+======== DATEIEN & SYNTAX ========
+
+✅ OK: start.py
+✅ OK: dashboard/webapp.py
+✅ OK: core/shared_state.py
+✅ OK: core/paper_trader/__init__.py
+✅ OK: core/scanner.py
+✅ OK: core/ai/online_rl.py
+✅ OK: core/ai/learning_module.py
+✅ OK: core/decision_engine/simple_decision.py
+❌ Syntaxfehler: requirements.txt
+
+======== UNICODE-STRICHE-SCAN ========
+
+⚠️ Typografische Striche gefunden (ersetzen durch '-'!): start.py, dashboard/webapp.py, core/ai/learning_module.py, core/decision_engine/simple_decision.py
+
+======== IMPORT & LERN-STATUS ========
+
+✅ Import: core.shared_state
+✅ Import: core.ai.online_rl
+• RL-Buffer-Länge: 0
+❌ Import-Fehler paper_trader: name 'pnl' is not defined
+❌ Import-Fehler scanner: name 'pnl' is not defined
+• Daycap-Reset bei Start erwähnt: JA
+
+======== MINI-SIMULATION (keine Echtverbindung) ========
+
+⚠️ Mini-Sim ausgelassen (online_rl/paper_trader Import fehlgeschlagen).
+
+======== MODELL & DATEIEN ========
+
+• models/: ['rl_model.pkl']
+• data/: ['open_trades.csv', 'experience.jsonl', 'closed_trades.csv', 'curriculum_state.json', 'pattern_memory.pkl', 'accounts.json']
+
+======== DASH START (app.run) ========
+
+• app.run gefunden in: start.py, dashboard/webapp.py

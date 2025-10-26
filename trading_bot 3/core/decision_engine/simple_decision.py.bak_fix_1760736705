@@ -1,0 +1,45 @@
+
+import random, time
+from core.ai import online_rl
+
+# --- Dynamischer Entscheidungsschwellenwert & Kapitalaufteilung ---
+decision_threshold = 0.40  # Startwert
+last_trade_time = 0
+
+def should_trade(confidence):
+    global decision_threshold, last_trade_time
+    now = time.time()
+    # Dynamische Anpassung: keine Trades -> senken, gute Trades -> erhöhen
+    if (now - last_trade_time) > 900:  # 15 Minuten keine Trades
+        decision_threshold = max(0.25, decision_threshold - 0.05)
+    elif (now - last_trade_time) < 120 and confidence > 0.7:
+        decision_threshold = min(0.75, decision_threshold + 0.05)
+    return confidence >= decision_threshold
+
+def choose_mode():
+    """60 % sicher, 40 % explorativ"""
+    mode = random.choices(["safe", "explore"], weights=[0.6, 0.4])[0]
+    leverage_boost = 1.0
+    threshold_factor = 1.0
+    if mode == "explore":
+        leverage_boost = random.uniform(1.3, 2.0)
+        threshold_factor = 0.85
+    return mode, leverage_boost, threshold_factor
+
+def decide_trade(symbol, market_features):
+    """Neue Knowledge-Driven Entscheidung"""
+    try:
+        k = getattr(online_rl.agent, "knowledge", 0.0)
+        perf = getattr(online_rl.agent, "performance_ewm", 0.0)
+        base_conf = abs(perf) * 0.4 + min(1.0, k / 100.0) * 0.6
+        base_conf += random.uniform(-0.05, 0.05)
+        conf = max(0.0, min(1.0, base_conf))
+        mode, lev_boost, th_factor = choose_mode()
+        ok = should_trade(conf * th_factor)
+        if ok:
+            global last_trade_time
+            last_trade_time = time.time()
+        return ok, mode, lev_boost, conf
+    except Exception as e:
+        print("[DECISION] Fehler:", e)
+        return False, "safe", 1.0, 0.0

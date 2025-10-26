@@ -1,0 +1,34 @@
+import os, importlib, threading, time, webbrowser, shutil
+print("=== ⚙️ CrazyBot Autostart (bereinigt) ===")
+
+# --- Cache löschen ---
+for root, dirs, files in os.walk('.'):
+    for d in dirs:
+        if d == "__pycache__":
+            shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+print("🧹 Cache gelöscht.\n")
+
+# --- Module prüfen ---
+modules = ["core.shared_state","core.paper_trader","core.ai.online_rl","dashboard.webapp"]
+for mod in modules:
+    try:
+        m = importlib.import_module(mod)
+        print(f"✅ Modul geladen: {mod} →", os.path.abspath(m.__file__))
+    except Exception as e:
+
+# --- Lernsystem starten ---
+try:
+    from core.ai import online_rl
+
+    threading.Thread(target=online_rl.start_online_rl_thread, daemon=True).start()
+    print("[ONLINE_RL] Lernsystem gestartet ✅")
+except Exception as e:
+
+# --- Dashboard starten ---
+try:
+    from dashboard import webapp
+    url = "http://127.0.0.1:8050/"
+    threading.Thread(target=lambda: (time.sleep(2), webbrowser.open(url)), daemon=True).start()
+    print(f"[DASHBOARD] Starte unter {url}")
+    webapp.app.run(host="0.0.0.0", port=8050, debug=False, use_reloader=False)
+except Exception as e:

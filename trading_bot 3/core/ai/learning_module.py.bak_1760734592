@@ -1,0 +1,49 @@
+
+import os, pickle, json, time
+import numpy as np
+
+MODEL_PATH = "models/rl_model.pkl"
+STATE_PATH = "data/curriculum_state.json"
+
+class RLAgent:
+    def __init__(self):
+        self.level = 0
+        self.rewards = []
+        self.performance = 0.0
+
+    def update(self, reward: float):
+        self.rewards.append(reward)
+        if len(self.rewards) > 100:
+            self.rewards.pop(0)
+        # Glättung: Durchschnittliche Belohnung
+        avg_reward = np.mean(self.rewards)
+        if avg_reward > 0.2:
+            self.level = min(10, self.level + 1)
+        elif avg_reward < -0.2:
+            self.level = max(0, self.level - 1)
+        self.performance = avg_reward
+
+    def save(self):
+        os.makedirs("models", exist_ok=True)
+        with open(MODEL_PATH, "wb") as f:
+            pickle.dump(self, f)
+        with open(STATE_PATH, "w") as f:
+            json.dump({"level": self.level, "recent_rewards": self.rewards[-5:]}, f)
+
+    @staticmethod
+    def load():
+        if os.path.exists(MODEL_PATH):
+            with open(MODEL_PATH, "rb") as f:
+                obj = pickle.load(f)
+            print(f"[RLAgent] Modell geladen (Level={obj.level}, Performance={obj.performance:+.2f})")
+            return obj
+        else:
+            print("[RLAgent] Neues Modell gestartet.")
+            return RLAgent()
+
+def save_model(agent_state):
+    agent_state.save()
+
+def load_model():
+    return RLAgent.load()
+

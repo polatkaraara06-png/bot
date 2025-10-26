@@ -1,0 +1,167 @@
+import time, threading, random
+from core.shared_state import shared_state
+from core.symbol_fetcher import get_dynamic_symbols
+from core.paper_trader import execute_trade
+from core.decision_engine.simple_decision import make_decision
+
+# ---------- Float-Helpers ----------
+def _to_float(x):
+    try:
+        if isinstance(x,(int,float)): return float(x)
+        if isinstance(x,str): return float(x.strip())
+    except Exception: return None
+    return None
+
+def _deep_price(v):
+    if v is None: return None
+    if isinstance(v,(int,float,str)): return _to_float(v)
+    if isinstance(v,dict):
+        for k in ("price","lastPrice","markPrice","p","value","data"):
+            if k in v:
+                p = _deep_price(v[k])
+                if p is not None: return p
+    if isinstance(v,list):
+        for item in v:
+            p = _deep_price(item)
+            if p is not None: return p
+    return None
+
+# ---------- Scanner-State ----------
+SCAN_INTERVAL = 30
+
+def _ensure_diag(reset=False):
+    with shared_state.lock:
+        acc = shared_state.accounts
+        acc.setdefault("hot_coins", [])
+        acc.setdefault("last_scan_ts", 0.0)
+        acc.setdefault("vol_cache", {})
+        acc.setdefault("trade_stats", {})
+        acc.setdefault("last_trade", {})
+        if reset:
+            acc["vol_cache"] = {}
+
+# ---------- Symbol-Scan ----------
+def scan_symbols(limit=60):
+    _ensure_diag()
+    try:
+        res = get_dynamic_symbols(limit=limit)
+        if isinstance(res, tuple) and len(res)==2:
+            spot, fut = list(res[0]), list(res[1])
+        else:
+            spot = fut = list(res)
+        all_syms = list(dict.fromkeys(spot+fut))
+        if "COAIUSDT" in all_syms:
+            all_syms.remove("COAIUSDT")
+        all_syms.insert(0,"COAIUSDT")  # Scalper-Priorität
+        scored = [(s,random.uniform(0.5,1.0)) for s in all_syms]
+        top10 = [s for s,_ in sorted(scored, key=lambda x:x[1], reverse=True)[:10]]
+        with shared_state.lock:
+            shared_state.accounts["hot_coins"] = top10
+            shared_state.accounts["last_scan_ts"] = time.time()
+        print(f"[SCAN] Hot Coins = {', '.join(top10)}")
+    except Exception as e:
+        print(f"[SCAN] Fehler: {e}")
+
+# ---------- Volatilitätsranking (gehärtet) ----------
+def _rank_by_vol(symbols):
+    with shared_state.lock:
+        ticks = dict(shared_state.ticks)
+        vol_cache = dict(shared_state.accounts.get("vol_cache", {}))
+    ranked, new_cache = [], {}
+    for s in symbols:
+        p = _deep_price(ticks.get(("spot",s)))
+        p = _to_float(p)
+        if p is None or p <= 0:
+            ranked.append((s,0.0)); continue
+        prev_raw = vol_cache.get(s, p)
+        # HART: immer in Float umwandeln
+        prev = _deep_price(prev_raw) if isinstance(prev_raw,dict) else _to_float(prev_raw)
+        prev = _to_float(prev)
+        if prev is None or prev <= 0:
+            prev = p
+        try:
+            move = abs(p - prev)/prev if prev > 0 else 0.0
+        except Exception:
+            move = 0.0
+        ranked.append((s, float(move)))
+        new_cache[s] = float(p)
+    with shared_state.lock:
+        vc = shared_state.accounts.setdefault("vol_cache", {})
+        for s,pr in new_cache.items():
+            vc[s] = float(pr)
+    ranked.sort(key=lambda x:x[1], reverse=True)
+    return [s for s,_ in ranked]
+
+def _price(symbol):
+    with shared_state.lock:
+        tick = shared_state.ticks.get(("spot",symbol))
+    return _deep_price(tick)
+
+def _diag(symbol, decision, price, source):
+    with shared_state.lock:
+        stats = shared_state.accounts.setdefault("trade_stats", {})
+        stats[symbol] = int(stats.get(symbol,0)) + 1
+    if len(stats) > 5:
+        # Nur letzte 5 Diagnosen behalten
+        for k in list(stats.keys())[:-5]:
+            stats.pop(k)
+        shared_state.accounts["last_trade"] = {
+            "symbol": symbol, "decision": decision, "price": float(price),
+            "ts": time.time(), "source": source
+        }
+
+# ---------- Loops ----------
+def scan_loop():
+    while True:
+        scan_symbols(); time.sleep(SCAN_INTERVAL)
+
+def start_scanner_thread():
+    _ensure_diag(reset=True)  # alten kaputten Cache weg
+    threading.Thread(target=scan_loop, daemon=True, name="ScannerLoop").start()
+    print("[BOOT] Scanner Thread läuft ✅")
+
+def scalper_trade_loop(interval=1.0):
+    # COAI + Volatilität
+    while True:
+        try:
+            with shared_state.lock:
+                hot = list(shared_state.accounts.get("hot_coins", []))
+            if "COAIUSDT" not in hot:
+                hot = ["COAIUSDT"] + hot
+            ranked = _rank_by_vol(hot)
+            pool = ranked[:5] if len(ranked)>=5 else ranked
+            symbol = random.choice(pool) if pool else None
+            if not symbol: time.sleep(interval); continue
+            price = _price(symbol)
+            price = _to_float(price)
+            if price is None: time.sleep(interval); continue
+            decision = make_decision(symbol)
+            if decision in ("buy","sell"):
+                print(f"[SCALPER] {symbol} → {decision.upper()} @ {price} | Auswahl: volatil/hotlist")
+                execute_trade(symbol, decision, price)
+                _diag(symbol, decision, price, "scalper_hotlist")
+        except Exception as e:
+            print(f"[SCALPER] Fehler: {e}")
+        time.sleep(interval)
+
+def swing_trade_loop(interval=14):
+    # Ruhige Basis: BTC/ETH/SOL
+    stable = ["BTCUSDT","ETHUSDT","SOLUSDT"]
+    while True:
+        try:
+            symbol = random.choice(stable)
+            price = _to_float(_price(symbol))
+            if price is None: time.sleep(interval); continue
+            decision = make_decision(symbol)
+            if decision in ("buy","sell"):
+                print(f"[TRADER] {symbol} → {decision.upper()} @ {price} | Auswahl: konservativ")
+                execute_trade(symbol, decision, price)
+                _diag(symbol, decision, price, "trader_stable")
+        except Exception as e:
+            print(f"[TRADER] Fehler: {e}")
+        time.sleep(interval)
+
+def start_auto_trade():
+    threading.Thread(target=scalper_trade_loop, daemon=True, name="ScalperLoop").start()
+    threading.Thread(target=swing_trade_loop, daemon=True, name="TraderLoop").start()
+    print("[BOOT] AutoTrade (Scalper+Trader) gestartet ✅")

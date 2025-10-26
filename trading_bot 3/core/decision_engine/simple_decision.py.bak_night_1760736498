@@ -1,0 +1,97 @@
+import time, statistics
+from collections import deque
+from core.shared_state import shared_state
+from core.ai.learning_module import RLAgent
+
+_agent = RLAgent.load()
+MAX_SECONDS = 15 * 60  # 15 Minuten Historie
+MAX_POINTS = 200
+
+def _now(): return time.time()
+
+def _ensure_recent(market, symbol, price):
+    key = (market, symbol)
+    with shared_state.lock:
+        feat = shared_state.features.setdefault(key, {})
+        dq = feat.get("recent")
+        if dq is None:
+            dq = feat["recent"] = deque(maxlen=MAX_POINTS)
+        dq.append((_now(), float(price)))
+        cutoff = _now() - MAX_SECONDS
+        while dq and dq[0][0] < cutoff:
+            dq.popleft()
+
+def _extract_series(market, symbol):
+    closes = []
+    with shared_state.lock:
+        bars = shared_state.bars.get("1m", {}).get((market, symbol))
+        if bars and len(bars) >= 5:
+            for b in list(bars)[-30:]:
+                if isinstance(b, dict) and "close" in b:
+                    closes.append(float(b["close"]))
+                elif isinstance(b, (list, tuple)) and len(b) >= 5:
+                    closes.append(float(b[-1]))
+        else:
+            feat = shared_state.features.get((market, symbol), {})
+            recent = feat.get("recent", deque())
+            closes = [float(p) for _, p in recent][-30:]
+    return closes
+
+def _rsi(values, length=14):
+    if len(values) <= length:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, length+1):
+        delta = values[-i] - values[-i-1]
+        (gains if delta >= 0 else losses).append(abs(delta))
+    avg_gain = sum(gains)/max(1,len(gains))
+    avg_loss = sum(losses)/max(1,len(losses))
+    if avg_loss == 0: return 70.0
+    rs = avg_gain/avg_loss
+    return 100 - (100 / (1 + rs))
+
+def build_features(symbol, market="spot"):
+    with shared_state.lock:
+        tick = shared_state.ticks.get((market, symbol), {})
+        price = tick.get("price")
+    if isinstance(price,(int,float)) and price>0:
+        _ensure_recent(market, symbol, price)
+    closes = _extract_series(market, symbol)
+    if len(closes)<2 and price:
+        closes = (closes or [])+[price]
+    feats = {}
+    if len(closes)>=2:
+        feats["momentum"] = (closes[-1]-closes[-2])/closes[-2]
+    else:
+        feats["momentum"]=0
+    def _ret(n):
+        return (closes[-1]-closes[-n-1])/closes[-n-1] if len(closes)>n else 0
+    feats["ret_5"]=_ret(5)
+    feats["ret_15"]=_ret(15)
+    if len(closes)>=5:
+        rets=[(closes[i]-closes[i-1])/closes[i-1] for i in range(1,len(closes))]
+        feats["volatility"]=statistics.pstdev(rets[-15:])
+    else:
+        feats["volatility"]=0
+    feats["rsi_14"]=_rsi(closes,14)
+    feats["agent_knowledge"]=_agent.knowledge
+    feats["performance_ewm"]=_agent.performance_ewm
+    return feats
+
+def make_decision(symbol, features=None, market="spot"):
+    f=features or build_features(symbol,market)
+    k=f.get("agent_knowledge",0)
+    mom=f.get("momentum",0)
+    ret5=f.get("ret_5",0)
+    ret15=f.get("ret_15",0)
+    vol=f.get("volatility",0)
+    rsi=f.get("rsi_14",50)
+    base=0.55*mom+0.3*ret5+0.2*ret15-0.15*vol
+    if rsi>60: base+=0.02
+    if rsi<40: base-=0.02
+    conf=min(1.0,k/100)
+    score=base*(0.5+0.5*conf)
+    thr=0.05*(1-0.5*conf)
+    if score>thr: return "buy"
+    if score<-thr: return "sell"
+    return None

@@ -1,0 +1,120 @@
+
+import time, random
+from ..shared_state import shared_state
+from core.ai import online_rl
+
+def _as_float(x, default=None):
+    try:
+        if isinstance(x,(int,float)): return float(x)
+        if isinstance(x,str): return float(x.strip())
+    except Exception: return default
+    return default
+
+def _extract_prices_from_ticks():
+    prices=[]
+    with shared_state.lock:
+        for v in shared_state.ticks.values():
+            if isinstance(v,dict) and "price" in v:
+                p=_as_float(v["price"])
+                if p and p>0: prices.append(p)
+    return prices
+
+def _current_price_for(symbol,market="spot",fallback=None):
+    with shared_state.lock:
+        v=shared_state.ticks.get((market,symbol),{})
+    if isinstance(v,dict) and "price" in v:
+        p=_as_float(v["price"])
+        return p if p and p>0 else fallback
+    return fallback
+
+def _dynamic_leverage():
+    prices=_extract_prices_from_ticks()
+    if len(prices)>=2:
+        hi,lo=max(prices),min(prices)
+        vola=(hi-lo)/hi if hi>0 else 0
+    else: vola=0
+    if vola<0.002: return 2
+    if vola<0.005: return 3
+    if vola<0.01:  return 4
+    return 5
+
+def _snapshot_features(symbol,side,entry,exit_p,qty,lev):
+    prices=_extract_prices_from_ticks()
+    if len(prices)>=3:
+        last,prev,prev2=prices[-1],prices[-2],prices[-3]
+        r1=(last-prev)/prev if prev else 0
+        r2=(prev-prev2)/prev2 if prev2 else 0
+    else: r1=r2=0
+    return {"side":side,"lev":float(lev),"ret1":float(r1),
+            "ret2":float(r2),"entry":float(entry),
+            "exit":float(exit_p),"qty":float(qty)}
+
+def _send_reward_to_rl(symbol,side,pnl,entry,exit_p,qty,lev):
+    try:
+        if pnl!=0:
+            action=f"close_{side}"
+            reward=float(pnl)
+            features=_snapshot_features(symbol,side,entry,exit_p,qty,lev)
+            online_rl.add_experience(symbol,action,reward,features)
+            print(f"[RL] Reward → {symbol}: {reward:+.2f}")
+    except Exception as e:
+        print("[RL] ⚠️ Reward-Fehler:",e)
+
+def execute_trade(symbol,action,price):
+    now=time.time()
+    price=_as_float(price,0.0)
+    if not price or price<=0: return
+    with shared_state.lock:
+        daycap=shared_state.accounts.setdefault("daycap",{"total":175.0,"used":0.0})
+        total_cap=float(daycap.get("total",175.0))
+        used_cap=float(daycap.get("used",0.0))
+        open_trades=shared_state.open_trades
+        closed_trades=shared_state.closed_trades
+        lev=_dynamic_leverage()
+        trade_value=random.uniform(10,25)
+        if (used_cap+trade_value)>total_cap:
+            print(f"[PAPER] ⚠️ Daycap erschöpft ({used_cap:.2f}/{total_cap:.2f})")
+            return
+        qty=trade_value/max(price,1e-9)
+        side="long" if action=="buy" else "short"
+        open_trades.append({
+            "symbol":symbol,"side":side,"entry_price":float(price),
+            "qty":float(qty),"timestamp":now,"leverage":float(lev)
+        })
+        daycap["used"]=float(used_cap+trade_value)
+        print(f"[PAPER] {side.upper():5s} {symbol} @ {price:.4f} | {trade_value:.2f} USDT (x{lev:.1f})")
+
+        # --- Auto-Close nach ~5s ---
+        now2=time.time()
+        to_close=[pos for pos in list(open_trades) if (now2-float(pos.get("timestamp",now2)))>5]
+        for pos in to_close:
+            cur=_current_price_for(pos["symbol"],"spot",fallback=pos["entry_price"])
+            entry=float(pos["entry_price"])
+            qty2=float(pos["qty"])
+            levp=float(pos.get("leverage",1.0))
+            pnl=(cur-entry)*qty2*levp if pos["side"]=="long" else (entry-cur)*qty2*levp
+            closed_trades.append({
+                "symbol":pos["symbol"],"side":pos["side"],
+                "entry_price":entry,"exit_price":float(cur),
+                "qty":qty2,"leverage":levp,"pnl":float(pnl),"timestamp":now2
+            })
+            if len(closed_trades)>5: del closed_trades[:-5]
+            try: open_trades.remove(pos)
+            except ValueError: pass
+
+            # --- Daycap-Regeneration ---
+            entry_val=entry*qty2
+            used_cap2=float(daycap.get("used",0.0))
+            if pnl >= 0:
+                freed = entry_val + pnl * 0.5
+                daycap["used"] = max(0.0, used_cap2 - freed)
+                daycap["total"] = float(daycap.get("total",175.0)) + abs(pnl) * 0.5
+            else:
+                freed = entry_val
+                daycap["used"] = max(0.0, used_cap2 - freed)
+            print(f"[PAPER] CLOSE {pos['side'].upper()} {pos['symbol']} @ {cur:.4f} | PnL={pnl:+.2f} (x{levp:.1f})")
+            _send_reward_to_rl(pos["symbol"],pos["side"],pnl,entry,cur,qty2,levp)
+
+        total_pnl=sum(_as_float(t.get("pnl"),0.0) or 0 for t in closed_trades)
+        shared_state.accounts["total_pnl"]=float(total_pnl)
+        shared_state.autosave()

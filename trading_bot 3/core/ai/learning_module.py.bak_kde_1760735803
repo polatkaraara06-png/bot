@@ -1,0 +1,82 @@
+import os, pickle, json, numpy as np
+
+MODEL_PATH = "models/rl_model.pkl"
+STATE_PATH = "data/curriculum_state.json"
+
+class RLAgent:
+    def __init__(self, level=0, rewards=None, performance=0.0):
+        self.level = int(level)
+        self.rewards = list(rewards or [])
+        self.performance = float(performance)
+
+    def update(self, reward: float):
+        self.rewards.append(float(reward))
+        if len(self.rewards) > 100:
+            self.rewards.pop(0)
+        avg = float(np.mean(self.rewards)) if self.rewards else 0.0
+        if   avg >  0.2: self.level = min(10, self.level + 1)
+        elif avg < -0.2: self.level = max(0,  self.level - 1)
+        self.performance = avg
+
+    def save(self):
+        os.makedirs(os.path.dirname(MODEL_PATH) or ".", exist_ok=True)
+        with open(MODEL_PATH, "wb") as f:
+            pickle.dump(self, f)
+        os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
+        with open(STATE_PATH, "w") as f:
+            json.dump({"level": self.level, "recent_rewards": self.rewards[-5:], "performance": self.performance}, f)
+
+    @staticmethod
+    def _from_legacy(obj):
+        """
+        Akzeptiere alte Formate:
+         - dict wie {"level":..., "rewards":[...], "performance":...} ODER {"symbol_avg":..., ...}
+         - tuple/list (zur Sicherheit)
+        """
+        if isinstance(obj, RLAgent):
+            return obj
+        if isinstance(obj, dict):
+            lvl = obj.get("level", 0)
+            rwd = obj.get("rewards", obj.get("recent_rewards", []))
+            perf = obj.get("performance", 0.0)
+            try:
+                return RLAgent(level=int(lvl), rewards=list(rwd), performance=float(perf))
+            except Exception:
+                return RLAgent()
+        if isinstance(obj, (tuple, list)) and len(obj)>=1:
+            try:
+                return RLAgent(level=int(obj[0]))
+            except Exception:
+                return RLAgent()
+        # sonst neu starten
+        return RLAgent()
+
+    @staticmethod
+    def load():
+        if os.path.exists(MODEL_PATH):
+            try:
+                with open(MODEL_PATH, "rb") as f:
+                    raw = pickle.load(f)
+                agent = RLAgent._from_legacy(raw)
+                print(f"[RLAgent] Modell geladen (Level={agent.level}, Performance={agent.performance:+.2f})")
+                # Bei Legacy: direkt im neuen Format speichern
+                if not isinstance(raw, RLAgent):
+                    agent.save()
+                    print("[RLAgent] Legacy-Format erkannt → in neues Format migriert ✅")
+                return agent
+            except Exception as e:
+                print("[RLAgent] Laden fehlgeschlagen, starte neu:", e)
+        print("[RLAgent] Neues Modell gestartet.")
+        return RLAgent()
+
+def save_model(agent_state):
+    # Abwärtskompatibler Wrapper
+    if isinstance(agent_state, RLAgent):
+        agent_state.save()
+    elif isinstance(agent_state, dict):
+        RLAgent._from_legacy(agent_state).save()
+    else:
+        RLAgent().save()
+
+def load_model():
+    return RLAgent.load()

@@ -1,0 +1,36 @@
+
+# === Shared State (Daycap & Performance) ===
+class SharedState:
+    def __init__(self):
+        self.daycap_start = 150.0   # Start-Kapital
+        self.daycap_used = 0.0
+        self.daycap_total = 150.0
+        self.total_profit = 0.0
+        self.total_loss = 0.0
+
+    @property
+    def available(self):
+        return max(0.0, self.daycap_total - self.daycap_used)
+
+    def apply_profit(self, profit: float):
+        # 50% Reinvest auf Daycap
+        reinvest = max(0.0, profit * 0.5)
+        self.daycap_total += reinvest
+        self.total_profit += profit
+        print(f"[STATE] Gewinn: +{profit:.2f}, Reinvest: +{reinvest:.2f}, Neuer Daycap: {self.daycap_total:.2f}")
+
+    def apply_loss(self, loss: float):
+        self.total_loss += loss
+        print(f"[STATE] Verlust: -{abs(loss):.2f}")
+
+    def summary(self):
+        total_pnl = self.total_profit + self.total_loss
+        return {
+            "Daycap": round(self.daycap_total, 2),
+            "Verfügbar": round(self.available, 2),
+            "Gesamt Gewinn": round(self.total_profit, 2),
+            "Gesamt Verlust": round(self.total_loss, 2),
+            "Gewinn/Verlust (gesamt)": round(total_pnl, 2),
+        }
+
+shared_state = SharedState()

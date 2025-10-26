@@ -1,0 +1,91 @@
+import os, json, time, socket, threading
+from websocket import WebSocketApp
+from dotenv import load_dotenv
+from ..shared_state import shared_state
+
+# IPv4 erzwingen (keine IPv6-Resolver)
+orig_getaddrinfo = socket.getaddrinfo
+def only_ipv4(*a, **k): 
+    return [r for r in orig_getaddrinfo(*a, **k) if r[0] == socket.AF_INET]
+socket.getaddrinfo = only_ipv4
+
+load_dotenv()
+
+# Nur Spot – kein Fallback, kein REST
+WSS_URL = "wss://stream.bybit.com/v5/public/spot"
+
+# Universum der Coins
+BASE_UNIVERSE = [
+    "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOGEUSDT",
+    "TRXUSDT","MATICUSDT","DOTUSDT","LTCUSDT","BCHUSDT","ATOMUSDT","LINKUSDT",
+    "XLMUSDT","XMRUSDT","APTUSDT","ARBUSDT","OPUSDT","NEARUSDT","ICPUSDT",
+    "FTMUSDT","INJUSDT","SUIUSDT","HBARUSDT","ALGOUSDT","GALAUSDT","SANDUSDT",
+    "AXSUSDT","APEUSDT","RNDRUSDT","PEPEUSDT","SHIBUSDT","TONUSDT","FLOWUSDT",
+    "EGLDUSDT","CRVUSDT","AAVEUSDT","DYDXUSDT","FILUSDT","BLURUSDT","STXUSDT",
+    "ONEUSDT","RUNEUSDT","ETCUSDT","KASUSDT","SEIUSDT","TIAUSDT"
+]
+
+def _on_message(ws, msg):
+    try:
+        data = json.loads(msg)
+        topic = data.get("topic", "")
+        now = time.time()
+        if "tickers" in topic:
+            arr = data.get("data")
+            if isinstance(arr, dict):
+                arr = [arr]
+            for it in arr or []:
+                sym = it.get("symbol")
+                last = it.get("lastPrice") or it.get("price")
+                if sym and last:
+                    shared_state.upsert_tick("spot", sym, float(last), now)
+                    shared_state.ws_status["spot"] = "connected"
+            if arr:
+                print(f"[WSS-SPOT] ✅ {len(arr)} Tick(s) empfangen ({arr[0].get('symbol')})")
+        elif "kline." in topic:
+            arr = data.get("data")
+            if isinstance(arr, dict):
+                arr = [arr]
+            for it in arr or []:
+                sym = it.get("symbol") or it.get("s")
+                if not sym:
+                    continue
+                cndl = {
+                    "ts": float(it.get("start", it.get("t", now))),
+                    "o": float(it.get("open", it.get("o", 0))),
+                    "h": float(it.get("high", it.get("h", 0))),
+                    "l": float(it.get("low", it.get("l", 0))),
+                    "c": float(it.get("close", it.get("c", 0))),
+                    "v": float(it.get("volume", it.get("v", 0))),
+                }
+                shared_state.add_candle("spot", sym, cndl)
+    except Exception as e:
+        shared_state.ws_status["spot"] = f"error:{e}"
+        print("[WSS-SPOT] ⚠️ Fehler im Message-Handler:", e)
+
+def _on_open(ws):
+    subs = [f"tickers.{s}" for s in BASE_UNIVERSE]
+    ws.send(json.dumps({"op": "subscribe", "args": subs}))
+    shared_state.ws_status["spot"] = "subscribed"
+    print(f"[WSS-SPOT] Subscribed to {len(BASE_UNIVERSE)} symbols.")
+
+def _on_close(ws, *a):
+    shared_state.ws_status["spot"] = "disconnected"
+    print("[WSS-SPOT] Closed ❌ Kein Fallback, reiner WSS-Modus.")
+
+
+def run():
+    def _runner():
+        url = WSS_URLS[0]
+        print(f"[WSS-SPOT] Verbinde mit {url}")
+        ws = WebSocketApp(
+            url,
+            on_open=_on_open,
+            on_message=_on_message,
+            on_close=_on_close
+        )
+        try:
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            print("[WSS-SPOT] ⚠️ Fehler im Haupt-Thread:", e)
+    threading.Thread(target=_runner, daemon=True).start()
