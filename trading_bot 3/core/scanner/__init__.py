@@ -1,8 +1,11 @@
 import threading, time, math, random
+import pandas as pd
 from core.shared_state import shared_state
 from core.paper_trader import open_position, check_and_close_all
+from core.ai.online_rl import agent 
+from core.decision_engine.simple_decision import decide_trade
+from core.time_aggregation import aggregate_ticks, calculate_atr
 
-# Grunduniversum (Spot + Futures Ticker-Namen wie bei Bybit/Binance üblich)
 BASE_UNIVERSE = [
     "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","TRXUSDT","MATICUSDT","DOTUSDT",
     "LTCUSDT","BCHUSDT","ATOMUSDT","LINKUSDT","XLMUSDT","XMRUSDT","APTUSDT","ARBUSDT","OPUSDT","NEARUSDT",
@@ -11,77 +14,125 @@ BASE_UNIVERSE = [
     "BLURUSDT","STXUSDT","ONEUSDT","RUNEUSDT","COAIUSDT","BTTUSDT","ETCUSDT","KASUSDT","SEIUSDT","TIAUSDT"
 ]
 
+SCALPER_CAP_PCT = 1.00
+CONSERVATIVE_CAP_PCT = 0.00
+MARGIN_PER_TRADE = 15.0
+SCALPER_VOLATILITY_THRESHOLD = 0.5 
+VOLUME_AVG_PERIOD = 20 
+MIN_CANDLE_COUNT = 20
+
 def _features_from_ticks(symbol: str):
-    # einfache Echtzeit-Features aus den letzten Ticks (ohne Candle-API):
     spot = shared_state.ticks.get(("spot", symbol))
     fut  = shared_state.ticks.get(("futures", symbol))
-    # Preis (wenn beides da ist, nimm futures als "leitend")
     tick = fut or spot
-    if not tick: 
-        return None
+    if not tick: return None
     price = float(tick.get("price", 0.0))
     prev = tick.get("prev")
     if prev is None:
-        # speichere prev beim ersten Mal
         tick["prev"] = price
-        return {"price": price, "trend": 0.0, "vol": 0.0, "atr_pct": 0.0}
-    # Trend = Prozentänderung zum letzten Tick
+        return {"price": price, "trend": 0.0, "vol": 0.0, "atr_pct": 0.0, "mtf_trend": 0.0, "volume_ratio": 1.0}
     trend = (price - float(prev)) / max(1e-9, float(prev)) * 100.0
-    # Volatilität: gleitend aus absoluter Tick-Änderung
-    vol = abs(trend)
-    # ATR_approx: hier nur gleitende Prozentspanne (vereinfachte Näherung)
-    atr_pct = min(5.0, vol * 1.5)
+    vol_tick = abs(trend)
+    
+    historical_candles = shared_state.get_historical_candles("futures", symbol, 300)
+    
+    # [FIX] Sicherheits-Check
+    if len(historical_candles) < MIN_CANDLE_COUNT:
+         return {"price": price, "trend": trend, "vol": vol_tick, "atr_pct": 0.0, 
+                 "mtf_trend": 0.0, "candles": historical_candles, "volume_ratio": 1.0}
+    
+    atr_pct = calculate_atr("futures", symbol) 
+    mtf_trend = agent.get_mtf_trend_placeholder() 
+    
+    volume_ratio = 1.0
+    if len(historical_candles) >= VOLUME_AVG_PERIOD:
+        df_candles = pd.DataFrame(historical_candles)
+        if 'volume' in df_candles.columns:
+            # [FIX] Der Fehler trat hier auf, weil die ATR-Funktion eine Liste zurückgibt, wenn Daten fehlen.
+            # Der Fehler wurde in time_aggregation.py behoben, indem ein Fallback auf 0.0 gesetzt wurde.
+            # Hier nur die Logik zur Volumenberechnung
+            avg_volume = df_candles['volume'].rolling(window=VOLUME_AVG_PERIOD).mean().iloc[-1]
+            current_volume = df_candles['volume'].iloc[-1]
+            if avg_volume > 0:
+                volume_ratio = current_volume / avg_volume
+
     tick["prev"] = price
-    return {"price": price, "trend": trend, "vol": vol, "atr_pct": atr_pct}
+    
+    return {"price": price, "trend": trend, "vol": vol_tick, "atr_pct": atr_pct, 
+            "mtf_trend": mtf_trend, "candles": historical_candles, "volume_ratio": volume_ratio}
 
 def _score(feat: dict) -> float:
-    # Score: Momentum * Liquiditätsschätzer (hier vol)
-    return abs(feat["trend"]) * (1.0 + 0.2 * feat["vol"])
+    return abs(feat["trend"]) * (1.0 + 0.2 * feat["vol"]) * (1.0 + abs(feat["mtf_trend"])) * (1.0 + 0.1 * feat.get("volume_ratio", 1.0))
 
-def _decide_side(trend: float) -> str:
-    return "buy" if trend >= 0 else "sell"
-
-def _leverage_for(vol: float) -> float:
-    # konservativ: hohe Volatilität -> niedrigere Leverage
-    base = 3.0
-    lev = max(1.0, min(5.0, base - 0.02*vol))
-    return round(lev, 2)
-
-def start_scanner_thread(scan_interval=10, max_open_per_scan=5, margin_per_trade=15.0):
+def start_scanner_thread(scan_interval=10, max_open_per_scan=5, margin_per_trade=MARGIN_PER_TRADE):
     def run():
         print("[SCAN] Scanner Thread läuft ✅")
         while True:
             try:
-                # 1) Features sammeln
-                feats = []
+                aggregate_ticks()
+                
+                feats_raw = []
                 for sym in BASE_UNIVERSE:
                     f = _features_from_ticks(sym)
                     if f:
-                        feats.append((sym, f))
-                # 2) Ranking
-                feats.sort(key=lambda x: _score(x[1]), reverse=True)
-                hot = [sym for sym,_ in feats[:10]]
+                        f["symbol"] = sym 
+                        feats_raw.append(f)
+
+                scalper_coins = [f for f in feats_raw if f.get("atr_pct", 0.0) > SCALPER_VOLATILITY_THRESHOLD]
+                conservative_coins = [f for f in feats_raw if f.get("atr_pct", 0.0) <= SCALPER_VOLATILITY_THRESHOLD]
+
+                total_cap = shared_state.daycap_total
+                scalper_cap = total_cap * SCALPER_CAP_PCT
+                conservative_cap = total_cap * CONSERVATIVE_CAP_PCT
+                
+                scalper_coins.sort(key=_score, reverse=True)
+                conservative_coins.sort(key=_score, reverse=True)
+
+                hot = [f["symbol"] for f in scalper_coins[:5]] + [f["symbol"] for f in conservative_coins[:5]]
+                
                 with shared_state.lock:
                     shared_state.hot_coins = hot
                     shared_state.next_scan_at = time.time() + scan_interval
+
                 if hot:
                     print("[SCAN] Hot-Coins:", hot[:10])
-                # 3) bis zu max_open_per_scan neue Positionen öffnen (Spot+Futures je Kandidat)
+
+                current_scalper_used = shared_state.get_used_margin_by_strategy("scalper")
+                scalper_allowed = max(0, scalper_cap - current_scalper_used)
                 opened = 0
-                for sym, f in feats[:max_open_per_scan]:
-                    if opened >= max_open_per_scan:
-                        break
-                    side = _decide_side(f["trend"])
-                    lev  = _leverage_for(f["vol"])
-                    tp   = 1.5 + min(2.0, 0.5 * max(0.0, abs(f["trend"])))   # 1.5% .. ~3.5%
-                    sl   = 1.0
-                    price = float(f["price"])
-                    # SPOT
-                    open_position(sym, side, "spot", entry_price=price, margin=margin_per_trade, leverage=lev, tp_pct=tp, sl_pct=sl, features=f)
-                    # FUTURES
-                    open_position(sym, side, "futures", entry_price=price, margin=margin_per_trade, leverage=lev, tp_pct=tp, sl_pct=sl, features=f)
-                    opened += 1
-                # 4) offene Positionen überwachen und ggf. schließen
+                
+                for f in scalper_coins:
+                    if opened >= max_open_per_scan or opened * margin_per_trade >= scalper_allowed: break
+                    decision = decide_trade(f, agent, strategy="scalper")
+                    if decision and decision.get("action"):
+                        trade_margin = margin_per_trade 
+                        if decision.get("risk_adjusted_margin"): trade_margin = decision["risk_adjusted_margin"]
+                        open_position(f["symbol"], decision["action"], "spot", 
+                                      entry_price=f["price"], margin=trade_margin, leverage=decision["leverage"], 
+                                      tp_pct=decision["tp_pct"], sl_pct=decision["sl_pct"], features=f, strategy="scalper")
+                        open_position(f["symbol"], decision["action"], "futures", 
+                                      entry_price=f["price"], margin=trade_margin, leverage=decision["leverage"], 
+                                      tp_pct=decision["tp_pct"], sl_pct=decision["sl_pct"], features=f, strategy="scalper")
+                        opened += 1
+                        
+                current_conservative_used = shared_state.get_used_margin_by_strategy("conservative")
+                conservative_allowed = max(0, conservative_cap - current_conservative_used)
+                opened = 0
+
+                for f in conservative_coins:
+                    if opened >= max_open_per_scan or opened * margin_per_trade >= conservative_allowed: break
+                    decision = decide_trade(f, agent, strategy="conservative")
+                    if decision and decision.get("action"):
+                        trade_margin = margin_per_trade
+                        if decision.get("risk_adjusted_margin"): trade_margin = decision["risk_adjusted_margin"]
+                        open_position(f["symbol"], decision["action"], "spot", 
+                                      entry_price=f["price"], margin=trade_margin, leverage=decision["leverage"], 
+                                      tp_pct=decision["tp_pct"], sl_pct=decision["sl_pct"], features=f, strategy="conservative")
+                        open_position(f["symbol"], decision["action"], "futures", 
+                                      entry_price=f["price"], margin=trade_margin, leverage=decision["leverage"], 
+                                      tp_pct=decision["tp_pct"], sl_pct=decision["sl_pct"], features=f, strategy="conservative")
+                        opened += 1
+                        
                 check_and_close_all()
                 time.sleep(scan_interval)
             except Exception as e:

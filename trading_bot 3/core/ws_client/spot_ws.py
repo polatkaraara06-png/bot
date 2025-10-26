@@ -3,16 +3,14 @@ from websocket import WebSocketApp
 from dotenv import load_dotenv
 from ..shared_state import shared_state
 
-# IPv4 erzwingen
 _orig_getaddrinfo = socket.getaddrinfo
 def _only_ipv4(*a, **k):
     return [r for r in _orig_getaddrinfo(*a, **k) if r[0] == socket.AF_INET]
 socket.getaddrinfo = _only_ipv4
 
 load_dotenv()
-WSS_URL = "wss://stream.bybit.com/v5/public/spot"
+WSS_URL = os.getenv("WSS_URL_SPOT", "wss://stream.bybit.com/v5/public/spot")
 
-# Max. 30 Symbole – stabiler Betrieb
 BASE_UNIVERSE = [
     "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOGEUSDT",
     "TRXUSDT","MATICUSDT","DOTUSDT","LTCUSDT","BCHUSDT","ATOMUSDT","LINKUSDT",
@@ -21,6 +19,29 @@ BASE_UNIVERSE = [
     "AXSUSDT","APEUSDT"
 ]
 
+def _process_ticker_data(data):
+    topic = data.get("topic","")
+    if not topic.startswith("tickers."):
+        return
+
+    arr = data.get("data")
+    if isinstance(arr, dict):
+        arr = [arr]
+    
+    now = time.time()
+    
+    for it in arr or []:
+        sym = (it.get("symbol") or "").upper()
+        last = it.get("lastPrice") or it.get("markPrice") 
+        
+        if sym and last:
+            try:
+                shared_state.upsert_tick("spot", sym, float(last), now)
+            except Exception as e:
+                print(f"[WSS-SPOT] ❌ Upsert-Fehler ({sym}): {e}")
+    
+    shared_state.ws_status["spot"] = "active"
+
 def _on_message(ws, msg):
     try:
         data = json.loads(msg)
@@ -28,25 +49,15 @@ def _on_message(ws, msg):
         print("[WSS-SPOT] ⚠ JSON decode error:", e)
         return
 
-    topic = data.get("topic","")
-    if topic.startswith("tickers."):
-        arr = data.get("data")
-        if isinstance(arr, dict):
-            arr = [arr]
-        now = time.time()
-        for it in arr or []:
-            sym = (it.get("symbol") or "").upper()
-            last = it.get("lastPrice") or it.get("price")
-            if sym and last:
-                shared_state.upsert_tick("spot", sym, float(last), now)
-        shared_state.ws_status["spot"] = "connected"
-    elif "success" in data:
+    _process_ticker_data(data)
+    
+    if "success" in data:
         print(f"[WSS-SPOT] Ack: {data.get('ret_msg')}")
 
 def _on_open(ws):
     subs = [f"tickers.{s}" for s in BASE_UNIVERSE]
     ws.send(json.dumps({"op": "subscribe", "args": subs}))
-    shared_state.ws_status["spot"] = "subscribed"
+    shared_state.ws_status["spot"] = "subscribed" 
     print(f"[WSS-SPOT] Subscribed to {len(subs)} symbols (tickers.*)")
 
 def _on_error(ws, e):
